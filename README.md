@@ -8,8 +8,9 @@ It is intentionally **not** the older `raffr85/hermes-devin-acp` implementation.
 
 - Launches `devin acp` as a subprocess.
 - Uses your already-authenticated Devin CLI account.
-- Discovers account-available models from `devin models list --format json`, with ACP `session/new` model options as a fallback.
-- Passes the selected Hermes model to Devin.
+- Discovers the models your account can **actually select** from the ACP `session/new` config option, falling back to `devin models list --format json` only when the session advertises no model option at all.
+- Passes the selected Hermes model to Devin, mapping family aliases (e.g. `swe`) and dotted ids (e.g. `swe-1.6-slow`) onto the advertised value.
+- Never fails a turn over a model the session does not advertise: an unresolvable choice falls back to the session default and says so in the log.
 - Supports Devin ACP filesystem and terminal requests inside the Hermes workspace.
 - Uses a Windsurf-compatible ACP client identity, configurable with `HERMES_DEVIN_ACP_WINDSURF_VERSION`.
 - Keeps the provider out of Hermes core.
@@ -36,7 +37,8 @@ or to `%HERMES_HOME%\plugins\model-providers\devin-acp` when `HERMES_HOME` is se
 
 4. Open `/model` and look for **Devin Subscription**.
 
-5. Choose `swe` or the exact SWE model exposed by your account.
+5. Choose a model from the list Hermes shows. The list is exactly what your ACP
+   session accepts, so any entry works.
 
 ## Optional environment overrides
 
@@ -52,6 +54,11 @@ The provider does **not** silently auto-approve ACP permission requests. If Devi
 
 The provider does implement the ACP terminal methods (`terminal/create`, `terminal/output`, `terminal/wait_for_exit`, `terminal/kill`, `terminal/release`) so normal Devin coding tasks can execute in the workspace when the Devin session mode permits them.
 
-## Why `swe`
+## Why `swe` is the only fallback model
 
-Devin's public CLI documentation says short names such as `swe` resolve to the latest version in the model family. This makes `swe` preferable to hard-coding a moving SWE model id.
+Devin's public CLI documentation says short names such as `swe` resolve to the
+latest version in the model family, and it is the one alias that resolves on
+every account seen so far (measured: `adaptive`, `gpt`, `opus` and `sonnet` are
+each rejected on an SWE-only account). The plugin therefore advertises `swe` as
+the fallback, lets the ACP session supply the real list, and resolves `swe`
+against whatever the session advertises.

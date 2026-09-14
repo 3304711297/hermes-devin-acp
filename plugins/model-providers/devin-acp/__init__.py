@@ -20,6 +20,9 @@ from providers.base import ProviderProfile
 
 logger = logging.getLogger(__name__)
 
+# Subcommands of the Devin CLI that are mutually exclusive with `models list`.
+_ACP_SUBCOMMANDS = frozenset({"acp"})
+
 
 class DevinACPClient:
     """OpenAI-client-shaped facade over ``devin acp``.
@@ -67,11 +70,44 @@ class DevinACPClient:
                 pass
 
     def list_models(self, timeout_seconds: float = 15.0) -> list[str]:
-        """Prefer the CLI catalog, then fall back to ACP session config options."""
-        command = self._command
+        """Return the models this account can actually select in an ACP session.
+
+        The ACP ``session/new`` config option is the only authority on what
+        ``session/set_config_option`` will accept, so it wins over the much
+        larger ``devin models list`` catalog (which is account-global, not
+        selectable per session). The catalog is used only when the session
+        advertises nothing at all, so an offline/flaky session probe does not
+        leave the user with an empty picker.
+        """
+        session_models = self._list_session_models(timeout_seconds)
+        if session_models:
+            return session_models
+
+        catalog = self._list_cli_catalog(timeout_seconds)
+        if catalog:
+            logger.warning(
+                "Devin ACP session advertised no model options; exposing the unverified "
+                "CLI catalog (%d models). Unlisted selections resolve to the session default.",
+                len(catalog),
+            )
+        return catalog
+
+    def _list_session_models(self, timeout_seconds: float) -> list[str]:
+        """Model values advertised by a real ACP session, or [] when unavailable."""
+        try:
+            session = self._new_session(timeout_seconds=timeout_seconds, allow_terminal=False)
+        except Exception as exc:
+            logger.debug("Devin ACP session model probe failed: %s", exc)
+            return []
+        finally:
+            self.close()
+        return _session_model_ids(session)
+
+    def _list_cli_catalog(self, timeout_seconds: float) -> list[str]:
+        """The account-wide `devin models list` catalog, or [] when unavailable."""
         try:
             result = subprocess.run(
-                [command, "models", "list", "--format", "json"],
+                [self._command, *self._catalog_args(), "models", "list", "--format", "json"],
                 capture_output=True,
                 text=True,
                 encoding="utf-8",
@@ -81,17 +117,19 @@ class DevinACPClient:
                 stdin=subprocess.DEVNULL,
             )
             if result.returncode == 0:
-                models = _parse_model_catalog(result.stdout)
-                if models:
-                    return models
-        except (OSError, subprocess.SubprocessError, ValueError):
-            pass
+                return _parse_model_catalog(result.stdout)
+        except (OSError, subprocess.SubprocessError, ValueError) as exc:
+            logger.debug("Devin CLI model catalog unavailable: %s", exc)
+        return []
 
-        try:
-            session = self._new_session(timeout_seconds=timeout_seconds, allow_terminal=False)
-            return _session_model_ids(session)
-        finally:
-            self.close()
+    def _catalog_args(self) -> list[str]:
+        """Base args minus the ACP subcommand.
+
+        ``devin models list`` is a sibling of ``devin acp``, so the configured ACP
+        args must not be forwarded to it, while unrelated flags (config paths,
+        verbosity) still are.
+        """
+        return [arg for arg in self._base_args if arg not in _ACP_SUBCOMMANDS]
 
     def _create_chat_completion(
         self,
@@ -138,12 +176,16 @@ class DevinACPClient:
             raise RuntimeError("Devin ACP did not return a sessionId.")
 
         requested_model = model.strip()
+        effective_model = requested_model
         if requested_model:
-            _apply_model_option(
-                self,
-                session,
-                requested_model,
-                timeout_seconds=timeout_seconds,
+            effective_model = (
+                _apply_model_option(
+                    self,
+                    session,
+                    requested_model,
+                    timeout_seconds=timeout_seconds,
+                )
+                or requested_model
             )
 
         # After model selection, continue within the same ACP process/session.
@@ -164,7 +206,7 @@ class DevinACPClient:
             reasoning_parts=reasoning_parts,
         )
 
-        actual_model = requested_model
+        actual_model = effective_model or requested_model
         stopped_model = self._actual_model_from_stopped_update
         if stopped_model:
             actual_model = stopped_model
@@ -181,8 +223,11 @@ class DevinACPClient:
         args = list(self._base_args)
         if model:
             # Official CLI syntax: global --model is accepted with devin acp.
-            if "--model" not in args:
-                args = [*args, "--model", model]
+            # Only pass values that cannot make the CLI reject startup; the
+            # session-authoritative value is applied later via set_config_option.
+            model_flag = _cli_model_flag(model)
+            if model_flag and "--model" not in args:
+                args = [*args, "--model", model_flag]
         self._spawn(args)
 
         process = self._proc
@@ -602,14 +647,8 @@ def _session_model_ids(session: dict[str, Any]) -> list[str]:
     return list(dict.fromkeys(result))
 
 
-def _apply_model_option(
-    client: DevinACPClient,
-    session: dict[str, Any],
-    requested_model: str,
-    *,
-    timeout_seconds: float,
-) -> None:
-    option = next(
+def _model_option(session: dict[str, Any]) -> dict[str, Any] | None:
+    return next(
         (
             option
             for option in (session.get("configOptions") or [])
@@ -618,25 +657,119 @@ def _apply_model_option(
         ),
         None,
     )
+
+
+class _ModelChoice(_SimpleNamespace):
+    """The model value that will really be sent, plus why it differs from the request."""
+
+    value: str
+    note: str
+
+
+def _advertised_model_values(option: dict[str, Any] | None) -> list[str]:
+    """Session-advertised model values in Devin's own order (duplicates removed)."""
     if not option:
-        return
-    valid = {
-        str(item.get("value"))
-        for item in (option.get("options") or [])
-        if isinstance(item, dict) and item.get("value") is not None
-    }
-    # Normalize dots to dashes (e.g. swe-1.6-slow -> swe-1-6-slow) if needed
-    if requested_model not in valid and requested_model.replace(".", "-") in valid:
-        requested_model = requested_model.replace(".", "-")
-    # If user requests 'swe' family alias and account only exposes a specific version (e.g. swe-1-6-slow)
-    if valid and requested_model in ("swe", "default"):
-        swe_candidates = [v for v in valid if "swe" in v]
-        if swe_candidates:
-            requested_model = swe_candidates[0]
-    if valid and requested_model not in valid:
+        return []
+    result: list[str] = []
+    for item in option.get("options") or []:
+        if isinstance(item, dict):
+            value = item.get("value")
+            if isinstance(value, str) and value.strip():
+                result.append(value.strip())
+    return list(dict.fromkeys(result))
+
+
+def _resolve_model_choice(
+    requested_model: str,
+    advertised: list[str],
+    default: str = "",
+) -> _ModelChoice:
+    """Map a requested model onto a value the live ACP session actually accepts.
+
+    Resolution order:
+      1. exact match on an advertised value;
+      2. dotted-version normalization (``swe-1.6-slow`` -> ``swe-1-6-slow``);
+      3. family match on every token of the request (``swe``, ``claude-sonnet``),
+         picking the earliest entry Devin itself advertises;
+      4. the session default, with the substitution reported in ``note``.
+
+    Raises only when the session advertised no model option at all, which means
+    this Devin build has no model selection surface to drive.
+    """
+    requested = (requested_model or "").strip()
+    if not advertised:
         raise RuntimeError(
-            f"Devin ACP does not advertise model '{requested_model}' for this account."
+            "Devin ACP did not advertise a model config option; cannot select a model."
         )
+
+    if requested in advertised:
+        return _ModelChoice(value=requested, note="")
+
+    normalized = requested.replace(".", "-")
+    if normalized in advertised:
+        return _ModelChoice(value=normalized, note="")
+
+    # Family aliases such as "swe" / "claude" / "sonnet": match on every token of
+    # the request so "swe-2" still resolves when the session only advertises
+    # "swe-2-enterprise". Among matches, the earliest advertised entry wins:
+    # Devin lists its current family default first, so "swe" behaves like
+    # Devin's own shorthand for the family instead of an arbitrary pick, and the
+    # result never depends on set/dict iteration order.
+    family_tokens = [t for t in requested.lower().replace("_", "-").split("-") if t]
+    if family_tokens:
+        value = next(
+            (
+                candidate
+                for candidate in advertised
+                if all(token in candidate.lower() for token in family_tokens)
+            ),
+            "",
+        )
+        if value:
+            return _ModelChoice(value=value, note=f"requested '{requested}' -> '{value}'")
+
+    fallback = default if default in advertised else advertised[0]
+    return _ModelChoice(
+        value=fallback,
+        note=(
+            f"requested '{requested}' is not advertised by this Devin session; "
+            f"using session default '{fallback}' instead"
+        ),
+    )
+
+
+def _apply_model_option(
+    client: DevinACPClient,
+    session: dict[str, Any],
+    requested_model: str,
+    *,
+    timeout_seconds: float,
+) -> str:
+    """Select the Devin session model, degrading instead of failing.
+
+    Returns the model value that was really sent to ``session/set_config_option``
+    (which may differ from ``requested_model`` when the session is narrower than
+    the account catalog), so callers and logs report the truth.
+    """
+    option = _model_option(session)
+    if not option:
+        logger.warning(
+            "Devin ACP did not advertise a model config option; leaving the session default in place."
+        )
+        return ""
+
+    advertised = _advertised_model_values(option)
+    default = str(option.get("currentValue") or "").strip()
+    choice = _resolve_model_choice(requested_model, advertised, default)
+    if choice.note:
+        logger.warning(
+            "Devin ACP model '%s' resolved to '%s' (%s). Advertised models: %s.",
+            requested_model,
+            choice.value,
+            choice.note,
+            ", ".join(advertised),
+        )
+
     process, inbox, stderr_tail = client._runtime
     client._request(
         process,
@@ -646,10 +779,27 @@ def _apply_model_option(
         {
             "sessionId": str(session.get("sessionId")),
             "configId": str(option.get("id") or "model"),
-            "value": requested_model,
+            "value": choice.value,
         },
         timeout_seconds=timeout_seconds,
     )
+    return choice.value
+
+
+def _cli_model_flag(model: str, advertised: list[str] | None = None) -> str:
+    """Return a ``--model`` value for process startup, or "" to omit the flag.
+
+    Only family aliases (``swe``) and values this account's session actually
+    advertises are safe: Devin CLI rejects unknown ids at startup, which would
+    make an unrelated model choice break the whole session.
+    """
+    requested = (model or "").strip()
+    if not requested:
+        return ""
+    advertised = list(advertised or [])
+    if advertised:
+        return _resolve_model_choice(requested, advertised).value
+    return requested if requested == "swe" else ""
 
 
 def _path_within_cwd(path_text: str, cwd: str) -> Path:
@@ -890,7 +1040,7 @@ devin_acp = DevinACPProfile(
     process_args=("acp",),
     process_command_env_vars=("HERMES_DEVIN_ACP_COMMAND", "DEVIN_CLI_PATH"),
     process_args_env_var="HERMES_DEVIN_ACP_ARGS",
-    fallback_models=("swe", "adaptive", "gpt", "opus", "sonnet"),
+    fallback_models=("swe",),
 )
 
 register_provider(devin_acp)

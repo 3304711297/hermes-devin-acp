@@ -1,7 +1,23 @@
 from __future__ import annotations
 
 import json
+import os
 import sys
+
+# The fake doubles as a CLI: `models list --format json` returns a catalog when
+# FAKE_DEVIN_CATALOG says so (used to test the CLI-catalog vs session-option
+# precedence). Everything else behaves as a `devin acp` server.
+ADVERTISED = [m for m in os.environ.get('FAKE_DEVIN_MODEL_OPTIONS', 'swe,swe-2').split(',') if m]
+CATALOG = [m for m in os.environ.get('FAKE_DEVIN_CATALOG', '').split(',') if m]
+
+if len(sys.argv) > 1 and sys.argv[1] == 'models':
+    if CATALOG:
+        print(json.dumps({'models': [{'id': m, 'name': m.upper()} for m in CATALOG]}))
+        sys.exit(0)
+    sys.exit(1)
+
+if os.environ.get('FAKE_DEVIN_FAIL_SESSION') == '1':
+    sys.exit(1)
 
 for raw in sys.stdin:
     req = json.loads(raw)
@@ -14,11 +30,11 @@ for raw in sys.stdin:
     elif method == 'session/new':
         print(json.dumps({'jsonrpc':'2.0','id':rid,'result':{
             'sessionId':'test-session',
-            'configOptions':[{'id':'model','type':'select','currentValue':'swe','options':[{'value':'swe','name':'SWE'},{'value':'swe-2','name':'SWE-2'}]}, {'id':'mode','type':'select','currentValue':'accept-edits','options':[{'value':'accept-edits','name':'Accept edits'},{'value':'bypass','name':'Bypass'}]}]
+            'configOptions':[{'id':'model','type':'select','currentValue':ADVERTISED[0] if ADVERTISED else '', 'options':[{'value':m,'name':m.upper()} for m in ADVERTISED]}, {'id':'mode','type':'select','currentValue':'accept-edits','options':[{'value':'accept-edits','name':'Accept edits'},{'value':'bypass','name':'Bypass'}]}]
         }}), flush=True)
     elif method == 'session/set_config_option':
         assert req['params']['configId'] in {'model','mode'}
-        assert (req['params']['configId'] == 'model' and req['params']['value'] in {'swe','swe-2'}) or (req['params']['configId'] == 'mode' and req['params']['value'] in {'accept-edits','bypass'})
+        assert (req['params']['configId'] == 'model' and req['params']['value'] in set(ADVERTISED)) or (req['params']['configId'] == 'mode' and req['params']['value'] in {'accept-edits','bypass'}), req['params']
         print(json.dumps({'jsonrpc':'2.0','id':rid,'result':{'configOptions':[]}}), flush=True)
     elif method == 'session/prompt':
         # Ask the client to execute a terminal command, exercising the full ACP
