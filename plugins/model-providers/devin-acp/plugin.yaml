@@ -1,0 +1,4 @@
+name: devin-acp-provider
+kind: model-provider
+version: 0.1.0
+description: Devin CLI subscription models via ACP
