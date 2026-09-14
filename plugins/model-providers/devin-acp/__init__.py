@@ -625,6 +625,14 @@ def _apply_model_option(
         for item in (option.get("options") or [])
         if isinstance(item, dict) and item.get("value") is not None
     }
+    # Normalize dots to dashes (e.g. swe-1.6-slow -> swe-1-6-slow) if needed
+    if requested_model not in valid and requested_model.replace(".", "-") in valid:
+        requested_model = requested_model.replace(".", "-")
+    # If user requests 'swe' family alias and account only exposes a specific version (e.g. swe-1-6-slow)
+    if valid and requested_model in ("swe", "default"):
+        swe_candidates = [v for v in valid if "swe" in v]
+        if swe_candidates:
+            requested_model = swe_candidates[0]
     if valid and requested_model not in valid:
         raise RuntimeError(
             f"Devin ACP does not advertise model '{requested_model}' for this account."
