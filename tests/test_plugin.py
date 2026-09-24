@@ -214,3 +214,59 @@ def test_cli_model_flag_only_carries_verified_or_alias_names():
     assert module._cli_model_flag("gpt-5-codex", None) == ""
     assert module._cli_model_flag("swe-1.6-slow", ["swe-1-6-slow"]) == "swe-1-6-slow"
     assert module._cli_model_flag("gpt-5-codex", ["swe-1-6-slow"]) == "swe-1-6-slow"
+
+
+def test_request_returns_a_response_that_arrived_as_the_process_exited():
+    """Regression: a response already in the inbox must not be discarded as a timeout.
+
+    The agent may answer and then exit before the pump thread delivers the
+    response; _request used to break out of its loop on process.poll() without
+    draining the inbox, turning a good answer into a spurious TimeoutError.
+    """
+    import queue
+    from collections import deque
+
+    module, _ = load_plugin()
+
+    class DeadProc:
+        def __init__(self):
+            self.stdin = self
+
+        def write(self, s):
+            pass
+
+        def flush(self):
+            pass
+
+        def poll(self):
+            return 0  # already exited
+
+    client = module.DevinACPClient(command="unused", args=[])
+    client._next_id = 0
+    inbox: queue.Queue = queue.Queue()
+    inbox.put({"jsonrpc": "2.0", "id": 1, "result": {"sessionId": "s-exit"}})
+    result = client._request(
+        DeadProc(),
+        inbox,
+        deque(maxlen=50),
+        "session/new",
+        {"cwd": "/tmp"},
+        timeout_seconds=5,
+    )
+    assert result == {"sessionId": "s-exit"}
+
+
+def test_apply_model_option_degrades_when_the_option_advertises_no_options(caplog):
+    """A model option with zero options must degrade, not kill the turn."""
+    module, _ = load_plugin()
+    session = {
+        "sessionId": "s",
+        "configOptions": [
+            {"id": "model", "type": "select", "currentValue": "", "options": []}
+        ],
+    }
+    client = _CaptureClient()
+    with caplog.at_level("WARNING"):
+        assert module._apply_model_option(client, session, "swe", timeout_seconds=1.0) == ""
+    assert client.sent_model_values() == []
+    assert any("no options" in record.message for record in caplog.records)
