@@ -54,10 +54,27 @@ class DevinACPClient:
         self.chat = _ChatNamespace(self)
         self.is_closed = False
         self._proc: subprocess.Popen[str] | None = None
+        self._terminal_ids: set[str] = set()
 
     def close(self) -> None:
         proc, self._proc = self._proc, None
         self.is_closed = True
+        # Terminals the agent created but never released must not outlive the
+        # client (e.g. after a timed-out turn). Only this client's own
+        # terminals are touched; other clients' entries in _TERMINALS are left
+        # alone.
+        terminal_ids, self._terminal_ids = self._terminal_ids, set()
+        for terminal_id in terminal_ids:
+            state = _TERMINALS.pop(terminal_id, None)
+            if state is not None and state.process.poll() is None:
+                try:
+                    state.process.terminate()
+                    state.process.wait(timeout=2)
+                except Exception:
+                    try:
+                        state.process.kill()
+                    except Exception:
+                        pass
         if proc is None:
             return
         try:
@@ -170,6 +187,14 @@ class DevinACPClient:
         return _completion_to_stream_chunks(completion)
 
     def _run_prompt(self, prompt: str, *, timeout_seconds: float, model: str) -> tuple[str, str, str]:
+        # The ACP subprocess (and any terminals the agent created) must not
+        # outlive the turn, even when the turn fails or times out.
+        try:
+            return self._run_prompt_inner(prompt, timeout_seconds=timeout_seconds, model=model)
+        finally:
+            self.close()
+
+    def _run_prompt_inner(self, prompt: str, *, timeout_seconds: float, model: str) -> tuple[str, str, str]:
         session = self._new_session(timeout_seconds=timeout_seconds, allow_terminal=True, model=model)
         session_id = str(session.get("sessionId") or "").strip()
         if not session_id:
@@ -210,7 +235,6 @@ class DevinACPClient:
         stopped_model = self._actual_model_from_stopped_update
         if stopped_model:
             actual_model = stopped_model
-        self.close()
         return "".join(text_parts), "".join(reasoning_parts), actual_model
 
     def _new_session(
@@ -404,6 +428,29 @@ class DevinACPClient:
                 raise RuntimeError(f"Devin ACP {method} failed: {err.get('message') or err}")
             return msg.get("result")
 
+        # The agent may have answered and then exited before the pump thread
+        # delivered the response (or the response arrived just as the deadline
+        # hit). Drain whatever is left in the inbox before declaring failure,
+        # so a good answer is never discarded as a timeout.
+        while True:
+            try:
+                msg = inbox.get_nowait()
+            except Exception:
+                break
+            try:
+                if self._handle_message(msg, process, text_parts, reasoning_parts):
+                    continue
+            except OSError:
+                # The agent process is gone; a late agent->client request can no
+                # longer be answered. Keep draining for our own response.
+                continue
+            if msg.get("id") != request_id:
+                continue
+            if "error" in msg:
+                err = msg.get("error") or {}
+                raise RuntimeError(f"Devin ACP {method} failed: {err.get('message') or err}")
+            return msg.get("result")
+
         stderr_text = "\n".join(stderr_tail).strip()
         if stderr_text:
             raise RuntimeError(f"Devin ACP process failed during {method}: {stderr_text}")
@@ -457,6 +504,9 @@ class DevinACPClient:
                 result = _write_text_file(params, self._cwd)
             elif method == "terminal/create":
                 result = _terminal_create(params, self._cwd)
+                terminal_id = result.get("terminalId")
+                if terminal_id:
+                    self._terminal_ids.add(terminal_id)
             elif method == "terminal/output":
                 result = _terminal_output(params)
             elif method == "terminal/wait_for_exit":
@@ -465,6 +515,7 @@ class DevinACPClient:
                 result = _terminal_kill(params)
             elif method == "terminal/release":
                 result = _terminal_release(params)
+                self._terminal_ids.discard(str(params.get("terminalId") or ""))
             elif method == "_cognition.ai/request_diagnostics":
                 result = {}
             else:
@@ -759,6 +810,11 @@ def _apply_model_option(
         return ""
 
     advertised = _advertised_model_values(option)
+    if not advertised:
+        logger.warning(
+            "Devin ACP advertised a model config option with no options; leaving the session default in place."
+        )
+        return ""
     default = str(option.get("currentValue") or "").strip()
     choice = _resolve_model_choice(requested_model, advertised, default)
     if choice.note:
